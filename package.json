@@ -2,8 +2,8 @@
   "name": "image-processor",
   "version": "1.0.0",
   "description": "AWS Lambda image processing function (resize + thumbnail + AVIF conversion)",
-  "main": "index.js",
-  "type": "commonjs",
+  "main": "index.mjs",
+  "type": "module",
   "scripts": {
     "test": "echo \"No tests\" && exit 0"
   },

@@ -1,24 +1,27 @@
-const sharp = require("sharp");
-const AWS = require("aws-sdk");
-const s3 = new AWS.S3();
+import sharp from "sharp";
+import {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+  HeadObjectCommand
+} from "@aws-sdk/client-s3";
 
-const { IMAGE_TYPE_POLICY } = require("./imageTypePolicy");
-const { VARIANTS } = require("./imageVariant"); 
+import { IMAGE_TYPE_POLICY } from "./policy/imageTypePolicy.js";
+import { VARIANTS } from "./policy/imageVariant.js";
 
+const s3 = new S3Client({});
 const BUCKET = "techcourse-project-2025";
 const ROOT_PREFIX = "fit-toring";
 const ALLOWED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 
-exports.handler = async (event) => {
+export const handler = async (event) => {
   const record = event.records?.[0] || event.Records?.[0];
   if (!record) return ok("no record");
 
   const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
   console.log("Event Key:", key);
 
-  if (key.toLowerCase().endsWith(".avif")) {
-    return ok("skip: avif");
-  }
+  if (key.toLowerCase().endsWith(".avif")) return ok("skip: avif");
 
   const parts = key.split("/");
   if (parts.length < 4) return err("key pattern mismatch");
@@ -34,30 +37,29 @@ exports.handler = async (event) => {
 
   const basename = filename.slice(0, extIdx);
   const ext = filename.slice(extIdx).toLowerCase();
-
   if (!ALLOWED_EXTENSIONS.includes(ext)) {
     return ok(`skip: unsupported ext ${ext}`);
   }
 
-  // 재귀 방지
+  // 재귀 호출 방지
   try {
-    const head = await s3.headObject({ Bucket: BUCKET, Key: key }).promise();
+    const head = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
     const processed = head.Metadata && head.Metadata.processed === "true";
     if (processed) return ok("skip: already processed default object");
   } catch (e) {
-    console.log("headObject failed (continue):", e?.message);
+    console.log("headObject failed (continue):", e?.name, e?.message);
   }
 
   const variants = IMAGE_TYPE_POLICY[imageType] || IMAGE_TYPE_POLICY._default;
   console.log("variants:", variants.map(v => `${v.name}:${v.maxWidth}`).join(", "));
 
-  let obj;
+  let srcBuffer;
   try {
-    obj = await s3.getObject({ Bucket: BUCKET, Key: key }).promise();
+    const obj = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    srcBuffer = Buffer.from(await obj.Body.transformToByteArray());
   } catch (e) {
     return err(`getObject failed: ${e.message}`);
   }
-  const srcBuffer = obj.Body;
 
   try {
     const tasks = [];
@@ -71,11 +73,12 @@ exports.handler = async (event) => {
         transparentToWhite: true,
         rotate: true,
       });
-      const avif = await toAvif(resized);
 
+      // 메타 데이터 추가
       const meta = (variant.name === VARIANTS.DEFAULT.name) ? { processed: "true" } : undefined;
 
       tasks.push(putObject(dstKeyExt, resized, contentTypeOf(ext), meta));
+      const avif = await toAvif(resized);
       tasks.push(putObject(dstKeyAvif, avif, "image/avif"));
     }
 
@@ -138,7 +141,13 @@ async function toAvif(buffer) {
 }
 
 async function putObject(Key, Body, ContentType, Metadata) {
-  await s3.putObject({ Bucket: BUCKET, Key, Body, ContentType, Metadata }).promise();
+  await s3.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key,
+    Body,
+    ContentType,
+    Metadata
+  }));
 }
 
 function ok(msg) {
