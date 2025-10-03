@@ -7,7 +7,7 @@
         -v "$PWD":/var/task -w /var/task \
         --entrypoint /bin/bash \
         public.ecr.aws/lambda/nodejs:22 \
-        -lc "npm ci"
+        -lc "npm install --omit=dev && node -e \"import('sharp').then(()=>console.log('sharp ok')).catch(e=>{console.error(e); process.exit(1);})\" && ls -la node_modules/sharp"
     ```
 
 2. ZIP 파일을 만듭니다.
