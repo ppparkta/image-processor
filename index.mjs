@@ -36,12 +36,16 @@ export const handler = async (event) => {
   if (extIdx < 0) return err("no extension");
 
   const basename = filename.slice(0, extIdx);
-  const ext = filename.slice(extIdx).toLowerCase();
-  if (!ALLOWED_EXTENSIONS.includes(ext)) {
-    return ok(`skip: unsupported ext ${ext}`);
-  }
 
-  // 재귀 호출 방지
+  // 원본 확장자(대소문자 보존)와 소문자 확장자 둘 다 보관
+  const extRaw = filename.slice(extIdx);           // 예: ".JPG"
+  const extLower = extRaw.toLowerCase();          // 예: ".jpg"
+  if (!ALLOWED_EXTENSIONS.includes(extLower)) {
+    return ok(`skip: unsupported ext ${extRaw}`);
+  }
+  const hasUpperInExt = /[A-Z]/.test(extRaw);
+
+  // 재귀 방지(head에 processed 메타데이터로 멱등/재귀 방지)
   try {
     const head = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
     const processed = head.Metadata && head.Metadata.processed === "true";
@@ -65,19 +69,27 @@ export const handler = async (event) => {
     const tasks = [];
     for (const variant of variants) {
       const outDir = `${ROOT_PREFIX}/${imageType}/${variant.name}`;
-      const dstKeyExt = `${outDir}/${basename}${ext}`;
+
+      // default 변환 산출물만 원본 확장자 케이스 유지
+      const extForVariant = (variant.name === VARIANTS.DEFAULT.name && hasUpperInExt)
+        ? extRaw
+        : extLower;
+
+      const dstKeyExt = `${outDir}/${basename}${extForVariant}`;
       const dstKeyAvif = `${outDir}/${basename}.avif`;
 
       const resized = await resizeToMaxWidth(srcBuffer, variant.maxWidth, {
-        targetExt: ext,
+        // 코덱 선택은 소문자 기준으로
+        targetExt: extLower,
         transparentToWhite: true,
         rotate: true,
       });
 
-      // 메타 데이터 추가
+      // default 키에는 processed=true 메타데이터로 재귀/멱등 방지
       const meta = (variant.name === VARIANTS.DEFAULT.name) ? { processed: "true" } : undefined;
 
-      tasks.push(putObject(dstKeyExt, resized, contentTypeOf(ext), meta));
+      tasks.push(putObject(dstKeyExt, resized, contentTypeOf(extLower), meta));
+
       const avif = await toAvif(resized);
       tasks.push(putObject(dstKeyAvif, avif, "image/avif"));
     }
