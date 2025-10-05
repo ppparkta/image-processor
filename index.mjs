@@ -5,14 +5,17 @@ import {
   PutObjectCommand,
   HeadObjectCommand
 } from "@aws-sdk/client-s3";
-
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { IMAGE_TYPE_POLICY } from "./policy/imageTypePolicy.js";
 import { VARIANTS } from "./policy/imageVariant.js";
 
 const s3 = new S3Client({});
+const sqs = new SQSClient({});
 const BUCKET = "techcourse-project-2025";
 const ROOT_PREFIX = "fit-toring";
 const ALLOWED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
+
+const QUEUE_URL = "https://sqs.ap-northeast-2.amazonaws.com/843255971531/fittoring-image-queue";
 
 export const handler = async (event) => {
   const record = event.records?.[0] || event.Records?.[0];
@@ -37,15 +40,13 @@ export const handler = async (event) => {
 
   const basename = filename.slice(0, extIdx);
 
-  // 원본 확장자(대소문자 보존)와 소문자 확장자 둘 다 보관
-  const extRaw = filename.slice(extIdx);           // 예: ".JPG"
-  const extLower = extRaw.toLowerCase();          // 예: ".jpg"
+  const extRaw = filename.slice(extIdx);      // 예: ".JPG"
+  const extLower = extRaw.toLowerCase();      // 예: ".jpg"
   if (!ALLOWED_EXTENSIONS.includes(extLower)) {
     return ok(`skip: unsupported ext ${extRaw}`);
   }
   const hasUpperInExt = /[A-Z]/.test(extRaw);
 
-  // 재귀 방지(head에 processed 메타데이터로 멱등/재귀 방지)
   try {
     const head = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
     const processed = head.Metadata && head.Metadata.processed === "true";
@@ -66,41 +67,84 @@ export const handler = async (event) => {
   }
 
   try {
-    const tasks = [];
-    for (const variant of variants) {
-      const outDir = `${ROOT_PREFIX}/${imageType}/${variant.name}`;
+    // variant 단위로 업로드 → SQS 발행을 순차 보장
+    await Promise.all(variants.map(v => produceOneVariant({
+      variant: v,
+      imageType,
+      basename,
+      extLower,
+      extRaw,
+      hasUpperInExt,
+      srcBuffer,
+    })));
 
-      // default 변환 산출물만 원본 확장자 케이스 유지
-      const extForVariant = (variant.name === VARIANTS.DEFAULT.name && hasUpperInExt)
-        ? extRaw
-        : extLower;
-
-      const dstKeyExt = `${outDir}/${basename}${extForVariant}`;
-      const dstKeyAvif = `${outDir}/${basename}.avif`;
-
-      const resized = await resizeToMaxWidth(srcBuffer, variant.maxWidth, {
-        // 코덱 선택은 소문자 기준으로
-        targetExt: extLower,
-        transparentToWhite: true,
-        rotate: true,
-      });
-
-      // default 키에는 processed=true 메타데이터로 재귀/멱등 방지
-      const meta = (variant.name === VARIANTS.DEFAULT.name) ? { processed: "true" } : undefined;
-
-      tasks.push(putObject(dstKeyExt, resized, contentTypeOf(extLower), meta));
-
-      const avif = await toAvif(resized);
-      tasks.push(putObject(dstKeyAvif, avif, "image/avif"));
-    }
-
-    await Promise.all(tasks);
     return ok(`done: ${filename}`);
   } catch (e) {
     console.error(e);
     return err(e.message || String(e));
   }
 };
+
+async function produceOneVariant({
+  variant,
+  imageType,
+  basename,
+  extLower,
+  extRaw,
+  hasUpperInExt,
+  srcBuffer,
+}) {
+  const outDir = `${ROOT_PREFIX}/${imageType}/${variant.name}`;
+
+  const extForVariant = (variant.name === VARIANTS.DEFAULT.name && hasUpperInExt)
+    ? extRaw
+    : extLower;
+
+  const dstKeyExt  = `${outDir}/${basename}${extForVariant}`;
+  const dstKeyAvif = `${outDir}/${basename}.avif`;
+
+  const resized = await resizeToMaxWidth(srcBuffer, variant.maxWidth, {
+    targetExt: extLower,
+    transparentToWhite: true,
+    rotate: true,
+  });
+
+  const meta = (variant.name === VARIANTS.DEFAULT.name) ? { processed: "true" } : undefined;
+
+  // 업로드 (원본확장자)
+  await putObject(dstKeyExt, resized, contentTypeOf(extLower), meta);
+  await sendSqsMessage({
+    event: "IMAGE_DERIVATIVE_READY",
+    imageType,
+    baseName: basename,
+    imageVariant: variant.name,
+    url: toS3Url(dstKeyExt),
+  });
+
+  // 업로드 (AVIF)
+  const avif = await toAvif(resized);
+  await putObject(dstKeyAvif, avif, "image/avif");
+}
+
+function toS3Url(key) {
+  const region = process.env.AWS_REGION || "ap-northeast-2";
+  const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+  return `https://${BUCKET}.s3.${region}.amazonaws.com/${encodedKey}`;
+}
+
+async function sendSqsMessage(payload) {
+  if (!QUEUE_URL) {
+    console.warn("[SQS] DERIVATIVE_QUEUE_URL is not set. Skip sending.", payload);
+    return;
+  }
+  await sqs.send(new SendMessageCommand({
+    QueueUrl: QUEUE_URL,
+    MessageBody: JSON.stringify(payload),
+    // FIFO 큐 전환 시 아래 두 줄을 추가
+    // MessageGroupId: payload.baseName,
+    // MessageDeduplicationId: `${payload.baseName}:${payload.imageVariant}:${payload.url}`,
+  }));
+}
 
 function contentTypeOf(ext) {
   switch (ext.toLowerCase()) {
