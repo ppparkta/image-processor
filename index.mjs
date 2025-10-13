@@ -15,7 +15,10 @@ const BUCKET = "techcourse-project-2025";
 const ROOT_PREFIX = "fit-toring";
 const ALLOWED_EXTENSIONS = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
 
-const QUEUE_URL = "https://sqs.ap-northeast-2.amazonaws.com/843255971531/fittoring-image-queue";
+const DEV_QUEUE_URL =
+  "https://sqs.ap-northeast-2.amazonaws.com/843255971531/fittoring-image-queue";
+const PROD_QUEUE_URL =
+  "https://sqs.ap-northeast-2.amazonaws.com/843255971531/fittoring-prod-image-queue";
 
 export const handler = async (event) => {
   const record = event.records?.[0] || event.Records?.[0];
@@ -27,21 +30,29 @@ export const handler = async (event) => {
   if (key.toLowerCase().endsWith(".avif")) return ok("skip: avif");
 
   const parts = key.split("/");
-  if (parts.length < 4) return err("key pattern mismatch");
+  if (parts.length < 5) return err("key pattern mismatch");
 
-  const [root, imageType, folder, ...rest] = parts;
-  if (root !== ROOT_PREFIX || folder !== VARIANTS.DEFAULT.name) {
-    return ok("skip: not under fit-toring/{type}/default/");
+  const [root, env, imageType, folder, ...rest] = parts;
+
+  if (root !== ROOT_PREFIX) {
+    return ok(`skip: not under ${ROOT_PREFIX}`);
   }
+  if (folder !== VARIANTS.DEFAULT.name) {
+    return ok(`skip: not default variant folder (${folder})`);
+  }
+
+  const ENV_FROM_KEY = env.toLowerCase();
+  const isProd = ENV_FROM_KEY === "prod";
+  const QUEUE_URL = isProd ? PROD_QUEUE_URL : DEV_QUEUE_URL;
 
   const filename = rest.join("/");
   const extIdx = filename.lastIndexOf(".");
   if (extIdx < 0) return err("no extension");
 
   const basename = filename.slice(0, extIdx);
-
   const extRaw = filename.slice(extIdx);      // 예: ".JPG"
   const extLower = extRaw.toLowerCase();      // 예: ".jpg"
+
   if (!ALLOWED_EXTENSIONS.includes(extLower)) {
     return ok(`skip: unsupported ext ${extRaw}`);
   }
@@ -56,7 +67,10 @@ export const handler = async (event) => {
   }
 
   const variants = IMAGE_TYPE_POLICY[imageType] || IMAGE_TYPE_POLICY._default;
-  console.log("variants:", variants.map(v => `${v.name}:${v.maxWidth}`).join(", "));
+  console.log(
+    `env=${ENV_FROM_KEY}, variants:`,
+    variants.map(v => `${v.name}:${v.maxWidth}`).join(", ")
+  );
 
   let srcBuffer;
   try {
@@ -67,17 +81,21 @@ export const handler = async (event) => {
   }
 
   try {
-    // variant 단위로 업로드 → SQS 발행을 순차 보장
-    await Promise.all(variants.map(v => produceOneVariant({
-      variant: v,
-      imageType,
-      basename,
-      extLower,
-      extRaw,
-      hasUpperInExt,
-      srcBuffer,
-    })));
-
+    await Promise.all(
+      variants.map(v =>
+        produceOneVariant({
+          variant: v,
+          imageType,
+          basename,
+          extLower,
+          extRaw,
+          hasUpperInExt,
+          srcBuffer,
+          env: ENV_FROM_KEY,
+          queueUrl: QUEUE_URL
+        })
+      )
+    );
     return ok(`done: ${filename}`);
   } catch (e) {
     console.error(e);
@@ -93,33 +111,36 @@ async function produceOneVariant({
   extRaw,
   hasUpperInExt,
   srcBuffer,
+  env,
+  queueUrl
 }) {
-  const outDir = `${ROOT_PREFIX}/${imageType}/${variant.name}`;
+  const outDir = `${ROOT_PREFIX}/${env}/${imageType}/${variant.name}`;
 
-  const extForVariant = (variant.name === VARIANTS.DEFAULT.name && hasUpperInExt)
-    ? extRaw
-    : extLower;
+  const extForVariant =
+    variant.name === VARIANTS.DEFAULT.name && hasUpperInExt ? extRaw : extLower;
 
-  const dstKeyExt  = `${outDir}/${basename}${extForVariant}`;
+  const dstKeyExt = `${outDir}/${basename}${extForVariant}`;
   const dstKeyAvif = `${outDir}/${basename}.avif`;
 
   const resized = await resizeToMaxWidth(srcBuffer, variant.maxWidth, {
     targetExt: extLower,
     transparentToWhite: true,
-    rotate: true,
+    rotate: true
   });
 
-  const meta = (variant.name === VARIANTS.DEFAULT.name) ? { processed: "true" } : undefined;
+  const meta =
+    variant.name === VARIANTS.DEFAULT.name ? { processed: "true" } : undefined;
 
-  // 업로드 (원본확장자)
+  // 업로드 (원본 확장자)
   await putObject(dstKeyExt, resized, contentTypeOf(extLower), meta);
   await sendSqsMessage({
     event: "IMAGE_DERIVATIVE_READY",
+    env,
     imageType,
     baseName: basename,
     imageVariant: variant.name,
-    url: toS3Url(dstKeyExt),
-  });
+    url: toS3Url(dstKeyExt)
+  }, queueUrl);
 
   // 업로드 (AVIF)
   const avif = await toAvif(resized);
@@ -128,22 +149,21 @@ async function produceOneVariant({
 
 function toS3Url(key) {
   const region = process.env.AWS_REGION || "ap-northeast-2";
-  const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+  const encodedKey = key.split("/").map(encodeURIComponent).join("/");
   return `https://${BUCKET}.s3.${region}.amazonaws.com/${encodedKey}`;
 }
 
-async function sendSqsMessage(payload) {
-  if (!QUEUE_URL) {
-    console.warn("[SQS] DERIVATIVE_QUEUE_URL is not set. Skip sending.", payload);
+async function sendSqsMessage(payload, queueUrl) {
+  if (!queueUrl) {
+    console.warn("[SQS] queueUrl not set. Skip sending.", payload);
     return;
   }
-  await sqs.send(new SendMessageCommand({
-    QueueUrl: QUEUE_URL,
-    MessageBody: JSON.stringify(payload),
-    // FIFO 큐 전환 시 아래 두 줄을 추가
-    // MessageGroupId: payload.baseName,
-    // MessageDeduplicationId: `${payload.baseName}:${payload.imageVariant}:${payload.url}`,
-  }));
+  await sqs.send(
+    new SendMessageCommand({
+      QueueUrl: queueUrl,
+      MessageBody: JSON.stringify(payload)
+    })
+  );
 }
 
 function contentTypeOf(ext) {
@@ -197,13 +217,15 @@ async function toAvif(buffer) {
 }
 
 async function putObject(Key, Body, ContentType, Metadata) {
-  await s3.send(new PutObjectCommand({
-    Bucket: BUCKET,
-    Key,
-    Body,
-    ContentType,
-    Metadata
-  }));
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: BUCKET,
+      Key,
+      Body,
+      ContentType,
+      Metadata
+    })
+  );
 }
 
 function ok(msg) {
